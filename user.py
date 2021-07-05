@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import hashlib
 import html
 import json
 import xml.etree.ElementTree as ET
@@ -8,7 +7,6 @@ from pathlib import Path
 
 import aiohttp
 
-import config
 import export
 
 data_dir = Path('data')
@@ -47,20 +45,21 @@ class UserSession:
             'User-Agent': 'ksoap2-android/2.6.0+',
             'SOAPAction': 'http://webservice.myi.cn/wmstudyservice/wsdl/' + action,
             'Content-Type': 'text/xml;charset=utf-8',
-            'Cookie': 'userguid=ffffffffffffffffffffffffffffffff;username=paduser;usergroupguid=ffffffffffffffffffffffffffffffff',
-            'Accept-Encoding': 'gzip'
+            'Accept-Encoding': 'gzip',
+            'Cookie': 'userguid=ffffffffffffffffffffffffffffffff'
         }, data=param_to_request_body(action, param)) as response:
             return await response.text()
 
-    async def get_user_classes(self, password):
+    async def get_user_classes(self):
         if self.data_path.exists():
             with self.data_path.open(mode='r') as f:
                 login_data = json.load(f)
         else:
-            login_data = json.loads(ET.fromstring(await self.fetch('UsersLoginJson', {
-                'lpszUserName': self.uid,
-                'lpszPasswordMD5': hashlib.md5(password.encode()).hexdigest(),
-                'lpszHardwareKey': config.HARDWARE_KEY,
+            guid = ET.fromstring(await self.fetch('UsersGetUserGUID', {
+                'lpszUserName': self.uid
+            }))[1][0][0].text
+            login_data = json.loads(ET.fromstring(await self.fetch('UsersGetUserInfoByGUID', {
+                'szUserGUID': guid,
             }))[1][0][0].text)
             with self.data_path.open(mode='w') as f:
                 json.dump(login_data, f)
@@ -74,19 +73,19 @@ class UserSession:
             'lpszResourceGUID': lesson_schedule['resourceguid']
         })
         try:
-            lesson_prepare_element = ET.fromstring(html.unescape(result))[1][0][0][0][0]
+            lesson_prepare_element = next(ET.fromstring(html.unescape(result)).iter('LessonsPrepare'))
             del lesson_prepare_element.attrib['guid']
             lesson_schedule.update(lesson_prepare_element.attrib)
         except:
             return
 
         file_resources = []
-        for ref in lesson_prepare_element[2]:
+        for ref in lesson_prepare_element.find('RefrenceResource').findall('Resource'):
             result = await self.fetch('GetResourceByGUID', {
                 'lpszResourceGUID': ref.attrib['guid']
             })
             try:
-                resource = ET.fromstring(html.unescape(result))[1][0][0][0][0]
+                resource = next(ET.fromstring(html.unescape(result)).iter('Resource'))
                 file_resources.append({'guid': ref.attrib['guid'], 'title': resource.attrib['title'],
                                        'ext': resource.attrib['mainFileExtName'],
                                        'fileURI': resource[2].attrib['fileURI']})
@@ -127,15 +126,15 @@ class UserClass:
                 'lpszLastSyncTime': '',
                 'szReturnXML': 'enablesegment=3;' + self.szReturnXML,
             }))
-            root = ET.fromstring(result)
-            response_attr = root[1][0][0][0].attrib
-            for record in root[1][0][0][0]:
-                self.szReturnXML += record[0].text + '=' + record[9].text + ';'
+            records = next(ET.fromstring(result).iter('LessonsScheduleRecordData'))
+            response_attr = records.attrib
+            for record in records:
                 lesson_schedule = {
-                    "guid": record[0].text,
-                    "resourceguid": record[4].text,
-                    "syn_timestamp": record[9].text
+                    "guid": record.find('guid').text,
+                    "resourceguid": record.find('resourceguid').text,
+                    "syn_timestamp": record.find('syn_timestamp').text
                 }
+                self.szReturnXML += lesson_schedule['guid'] + '=' + lesson_schedule['syn_timestamp'] + ';'
                 self.lesson_schedules.append(lesson_schedule)
                 tasks.append(asyncio.create_task(us.get_lesson_schedule_details(lesson_schedule)))
         await asyncio.wait(tasks) if tasks else None
@@ -146,7 +145,7 @@ async def main(args):
     async with aiohttp.ClientSession() as session:
         username = args.username.split('@')
         us = UserSession(session, username[0], username[1])
-        user_classes = await us.get_user_classes(args.password if args.password else '123456')
+        user_classes = await us.get_user_classes()
         tasks = []
         for user_class in user_classes:
             tasks.append(asyncio.create_task(user_class.fetch_lesson_schedules_table(us)))
